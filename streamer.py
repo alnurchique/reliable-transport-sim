@@ -24,11 +24,13 @@ class Streamer:
         self.MAX_PAYLOAD = 1392
         self.TIMEOUT = 0.25
         self.WINDOW_SIZE = 5
+        self.SEQ_NUM_MODULO = 2**32
         
         # Sequence number management
-        self.base = 0  # First unacked packet
-        self.next_seq_num = 0  # Next sequence number to use
+        self.base = 0
+        self.next_seq_num = 0
         self.expected_seq_num = 0
+        self.next_seq_to_deliver = 0  # Track what we should deliver next
         
         # Sliding window management
         self.window_lock = Lock()
@@ -36,7 +38,7 @@ class Streamer:
         self.timer = None
         self.timer_lock = Lock()
         
-        # Receive buffer for out-of-order packets
+        # Receive buffer
         self.receive_buffer = {}
         self.buffer_lock = Lock()
         
@@ -77,18 +79,26 @@ class Streamer:
         except Exception:
             return 0, PacketType.DATA, b'', False
 
+    def _is_between(self, start: int, value: int, end: int) -> bool:
+        """Check if value is between start and end, accounting for wrap-around."""
+        mod = self.SEQ_NUM_MODULO
+        if start <= end:
+            return start <= value <= end
+        return (start <= value < mod) or (0 <= value <= end)
+
     def _handle_timeout(self):
-        """Timeout handler for Go-Back-N retransmission"""
+        """Handle retransmission timeout"""
         with self.window_lock:
-            # Retransmit all packets in window
             current_base = self.base
-            for seq_num in range(current_base, self.next_seq_num):
-                if seq_num in self.window_buffer:
-                    packet, _ = self.window_buffer[seq_num]
-                    self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+            current_next = self.next_seq_num
             
-            # Reset timer if there are still packets in flight
-            if self.base < self.next_seq_num:
+            while current_base != current_next:
+                if current_base in self.window_buffer:
+                    packet, _ = self.window_buffer[current_base]
+                    self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                current_base = (current_base + 1) % self.SEQ_NUM_MODULO
+            
+            if self.base != self.next_seq_num:
                 with self.timer_lock:
                     self.timer = Timer(self.TIMEOUT, self._handle_timeout)
                     self.timer.start()
@@ -98,18 +108,13 @@ class Streamer:
         offset = 0
         while offset < len(data_bytes) and not self.closed:
             with self.window_lock:
-                # Send while window isn't full and we have data
-                while (self.next_seq_num < self.base + self.WINDOW_SIZE and 
-                       offset < len(data_bytes)):
-                    # Prepare and send packet
+                while (self.next_seq_num - self.base) % self.SEQ_NUM_MODULO < self.WINDOW_SIZE and offset < len(data_bytes):
                     chunk = data_bytes[offset:offset + self.MAX_PAYLOAD]
                     packet = self._create_packet(chunk, self.next_seq_num, PacketType.DATA)
                     self.socket.sendto(packet, (self.dst_ip, self.dst_port))
                     
-                    # Store packet in window buffer
                     self.window_buffer[self.next_seq_num] = (packet, time.time())
                     
-                    # Start timer if this is the first packet in window
                     if self.base == self.next_seq_num:
                         with self.timer_lock:
                             if self.timer:
@@ -118,10 +123,10 @@ class Streamer:
                             self.timer.start()
                     
                     offset += len(chunk)
-                    self.next_seq_num += 1
+                    self.next_seq_num = (self.next_seq_num + 1) % self.SEQ_NUM_MODULO
             
             # Wait if window is full
-            while self.next_seq_num >= self.base + self.WINDOW_SIZE and not self.closed:
+            while (self.next_seq_num - self.base) % self.SEQ_NUM_MODULO >= self.WINDOW_SIZE and not self.closed:
                 time.sleep(0.01)
 
     def listener(self):
@@ -135,33 +140,36 @@ class Streamer:
                     continue
                 
                 if pkt_type == PacketType.DATA:
-                    # Only accept in-order packets
-                    if seq_num == self.expected_seq_num:
-                        # Send cumulative ACK
-                        ack = self._create_packet(b'', seq_num, PacketType.ACK)
-                        self.socket.sendto(ack, (self.dst_ip, self.dst_port))
-                        
+                    # Always store in-window packets
+                    if self._is_between(self.expected_seq_num, seq_num, 
+                                      (self.expected_seq_num + self.WINDOW_SIZE) % self.SEQ_NUM_MODULO):
                         with self.buffer_lock:
                             self.receive_buffer[seq_num] = data
-                            self.expected_seq_num += 1
-                    elif seq_num > self.expected_seq_num:
-                        # Send ACK for last correctly received packet
-                        ack = self._create_packet(b'', self.expected_seq_num - 1, PacketType.ACK)
-                        self.socket.sendto(ack, (self.dst_ip, self.dst_port))
+                            
+                            # If this is the packet we're waiting for, process consecutive packets
+                            if seq_num == self.expected_seq_num:
+                                while self.expected_seq_num in self.receive_buffer:
+                                    self.expected_seq_num = (self.expected_seq_num + 1) % self.SEQ_NUM_MODULO
+                    
+                    # Always send ACK for the highest consecutive packet received
+                    ack = self._create_packet(b'', (self.expected_seq_num - 1) % self.SEQ_NUM_MODULO, 
+                                            PacketType.ACK)
+                    self.socket.sendto(ack, (self.dst_ip, self.dst_port))
                 
                 elif pkt_type == PacketType.ACK:
                     with self.window_lock:
-                        if seq_num >= self.base:
-                            # Cumulative ACK - remove all packets up to this one
+                        if self._is_between(self.base, seq_num + 1, self.next_seq_num):
                             old_base = self.base
-                            self.base = seq_num + 1
+                            self.base = (seq_num + 1) % self.SEQ_NUM_MODULO
                             
-                            # Remove acknowledged packets from window
-                            for i in range(old_base, self.base):
-                                self.window_buffer.pop(i, None)
+                            # Remove acknowledged packets
+                            current = old_base
+                            while current != self.base:
+                                self.window_buffer.pop(current, None)
+                                current = (current + 1) % self.SEQ_NUM_MODULO
                             
-                            # Reset timer if there are still packets in flight
-                            if self.base < self.next_seq_num:
+                            # Reset timer if needed
+                            if self.base != self.next_seq_num:
                                 with self.timer_lock:
                                     if self.timer:
                                         self.timer.cancel()
@@ -190,8 +198,10 @@ class Streamer:
         """Receive data in order"""
         while not self.closed:
             with self.buffer_lock:
-                if self.expected_seq_num - 1 in self.receive_buffer:
-                    return self.receive_buffer.pop(self.expected_seq_num - 1)
+                if self.next_seq_to_deliver in self.receive_buffer:
+                    data = self.receive_buffer.pop(self.next_seq_to_deliver)
+                    self.next_seq_to_deliver = (self.next_seq_to_deliver + 1) % self.SEQ_NUM_MODULO
+                    return data
             
             if self.fin_received.is_set() and not self.receive_buffer:
                 return b''
@@ -205,7 +215,7 @@ class Streamer:
             return
         
         # Wait for all packets to be acknowledged
-        while self.base < self.next_seq_num and not self.closed:
+        while self.base != self.next_seq_num and not self.closed:
             time.sleep(0.1)
         
         # Cancel timer
